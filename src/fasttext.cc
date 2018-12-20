@@ -18,6 +18,9 @@
 #include <string>
 #include <thread>
 #include <vector>
+#ifdef CUDA_FASTTEXT
+#include "cudamodel.h"
+#endif
 
 namespace fasttext {
 
@@ -633,7 +636,11 @@ void FastText::trainThread(int32_t threadId) {
   std::ifstream ifs(args_->input);
   utils::seek(ifs, threadId * utils::size(ifs) / args_->thread);
 
+#ifdef CUDA_FASTTEXT
+  CudaModel model(input_, output_, args_, threadId);
+#else
   Model model(input_, output_, args_, threadId);
+#endif
   if (args_->model == model_name::sup) {
     model.setTargetCounts(dict_->getCounts(entry_type::label));
   } else {
@@ -775,6 +782,9 @@ void FastText::startThreads() {
     printInfo(1.0, loss_, std::cerr);
     std::cerr << std::endl;
   }
+#ifdef CUDA_FASTTEXT
+  CudaModel::CudaCleanup(input_, output_);
+#endif 
 }
 
 int FastText::getDimension() const {

@@ -71,6 +71,7 @@ class Model {
       std::shared_ptr<Matrix>,
       std::shared_ptr<Args>,
       int32_t);
+  virtual ~Model() {}
 
   real binaryLogistic(int32_t, bool, real);
   real negativeSampling(int32_t, real);
@@ -103,7 +104,7 @@ class Model {
       std::vector<std::pair<real, int32_t>>&,
       Vector&,
       Vector&) const;
-  void update(
+  virtual void update(
       const std::vector<int32_t>&,
       const std::vector<int32_t>&,
       int32_t,
@@ -117,7 +118,7 @@ class Model {
   void setTargetCounts(const std::vector<int64_t>&);
   void initTableNegatives(const std::vector<int64_t>&);
   void buildTree(const std::vector<int64_t>&);
-  real getLoss() const;
+  virtual real getLoss();
   real sigmoid(real) const;
   real log(real) const;
   real std_log(real) const;

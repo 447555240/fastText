@@ -33,6 +33,9 @@ class Matrix {
   Matrix(const Matrix&) = default;
   Matrix& operator=(const Matrix&) = delete;
 
+  inline const std::vector<real>& vector() const {
+    return data_;
+  }
   inline real* data() {
     return data_.data();
   }

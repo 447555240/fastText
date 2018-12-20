@@ -389,7 +389,7 @@ void Model::buildTree(const std::vector<int64_t>& counts) {
   }
 }
 
-real Model::getLoss() const {
+real Model::getLoss() {
   return loss_ / nexamples_;
 }
 

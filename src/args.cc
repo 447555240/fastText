@@ -43,6 +43,7 @@ Args::Args() {
   qnorm = false;
   cutoff = 0;
   dsub = 2;
+  batchsize = 10000;
 }
 
 std::string Args::lossToString(loss_name ln) const {
@@ -171,6 +172,8 @@ void Args::parseArgs(const std::vector<std::string>& args) {
         cutoff = std::stoi(args.at(ai + 1));
       } else if (args[ai] == "-dsub") {
         dsub = std::stoi(args.at(ai + 1));
+      } else if (args[ai] == "-batchsize") {
+        batchsize = std::stoi(args.at(ai + 1));
       } else {
         std::cerr << "Unknown argument: " << args[ai] << std::endl;
         printHelp();
@@ -237,6 +240,7 @@ void Args::printTrainingHelp() {
       << "  -loss               loss function {ns, hs, softmax, one-vs-all} ["
       << lossToString(loss) << "]\n"
       << "  -thread             number of threads [" << thread << "]\n"
+      << "  -batchsize          cuda batch size (enable with CUDA build only) [" << batchsize << "]\n"
       << "  -pretrainedVectors  pretrained word vectors for supervised learning ["
       << pretrainedVectors << "]\n"
       << "  -saveOutput         whether output params should be saved ["
