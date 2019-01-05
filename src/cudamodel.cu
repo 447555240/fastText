@@ -93,7 +93,7 @@ void CudaModel::CudaCleanup(std::shared_ptr<Matrix> wi, std::shared_ptr<Matrix> 
   cudaDeviceReset();
 }
 
-const real epsilon = 0.001f;
+const real epsilon = 0.00001f;
 void CudaModel::verify(const char* prefix) {
   assert(args_->thread==1);
   printf("\n");
@@ -137,10 +137,11 @@ void CudacomputeHidden(int32_t* input, size_t input_n, real* hidden, real* wi) {
 
   if( threadIdx.x==0 )
     atomicAdd(&hidden[hidden_idx], sum);
-  __syncthreads();
+}
 
-  if( input_idx==0 )
-    hidden[hidden_idx] /= input_n;
+__global__
+void CudaAverageHidden(size_t input_n, real* hidden) {
+  hidden[threadIdx.x] /= input_n;
 }
 
 __device__
@@ -259,10 +260,6 @@ void CudacomputeOutput(real* hidden, real* output, size_t output_n, real* wo) {
   if( output_idx >= output_n )
     return;
 
-  if( blockIdx.x==0 )
-    output[output_idx] = 0.0;
-  __syncthreads();
-
   atomicAdd(&output[output_idx], wo[output_idx*gridDim.x+hidden_idx]*hidden[hidden_idx]);
 }
 
@@ -287,6 +284,7 @@ void CudaupdateOutput(real* grad, real* wo, real* hidden, real* softmax_output, 
 void CudaModel::softmax(int32_t target, real lr) {
   dim3 DimThread(256, 1, 1);
   dim3 DimBlock(args_->dim, (output_.size()+DimThread.x-1)/DimThread.x, 1);
+  cudaMemset(thrust::raw_pointer_cast(d_output_.data()), 0, d_output_.size()*sizeof(real));
   CudacomputeOutput<<<DimBlock, DimThread, 0, stream_>>>(
     thrust::raw_pointer_cast(d_hidden_.data()),
     thrust::raw_pointer_cast(d_output_.data()),
@@ -401,14 +399,20 @@ void CudaModel::update(
     return;
   }
 
+  // Get sum of input to hidden
   d_input_ = input;
-  dim3 DimThread(256, 1, 1);
-  dim3 DimBlock(args_->dim, (input.size()+DimThread.x-1)/DimThread.x, 1);
-  CudacomputeHidden<<<DimBlock, DimThread, 0, stream_>>>(
+  cudaMemset(thrust::raw_pointer_cast(d_hidden_.data()), 0, d_input_.size()*sizeof(real));
+  dim3 DimBlock(std::min<int>(1024, input.size()), 1, 1);
+  dim3 DimGrid(args_->dim, (input.size()+DimBlock.x-1)/DimBlock.x, 1);
+  CudacomputeHidden<<<DimGrid, DimBlock, 0, stream_>>>(
     thrust::raw_pointer_cast(d_input_.data()),
     d_input_.size(),
     thrust::raw_pointer_cast(d_hidden_.data()),
     thrust::raw_pointer_cast(d_wi_->data()));
+  cudaStreamSynchronize(stream_);
+
+  // Average hidden
+  CudaAverageHidden<<<1, args_->dim, 0, stream_>>>(input.size(), thrust::raw_pointer_cast(d_hidden_.data()));
   cudaStreamSynchronize(stream_);
 
   //Model::computeHidden(input, hidden_);
