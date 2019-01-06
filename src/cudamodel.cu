@@ -65,6 +65,7 @@ CudaModel::CudaModel(
 }
 
 CudaModel::~CudaModel() {
+  flush();
   cudnnDestroyTensorDescriptor(cudnn_desc_);
   cudnnDestroy(cudnn_);
 }
@@ -179,8 +180,6 @@ void CudabinaryLogistic(int32_t* target, Bool* label, real lr,
   __shared__ real alpha;
   if( threadIdx.x==0 )
     dotRow = 0.0;
-  if( blockIdx.x==0 )
-    grad[threadIdx.x] = 0.0; 
   __syncthreads();
 
   atomicAdd(&dotRow, wo[target[target_idx]*blockDim.x+hidden_idx]*hidden[hidden_idx]);
@@ -218,6 +217,7 @@ void CudaModel::negativeSampling(int32_t target, real lr) {
   d_target_ = h_target;
   d_label_ = h_label;
 
+  cudaMemset(thrust::raw_pointer_cast(d_grad_.data()), 0, d_grad_.size()*sizeof(real));
   CudabinaryLogistic<<<args_->neg+1, args_->dim, 0, stream_>>>(
     thrust::raw_pointer_cast(d_target_.data()),
     thrust::raw_pointer_cast(d_label_.data()),
@@ -241,6 +241,7 @@ void CudaModel::hierarchicalSoftmax(int32_t target, real lr) {
   d_target_ = pathToRoot;
   d_label_ = h_label;
 
+  cudaMemset(thrust::raw_pointer_cast(d_grad_.data()), 0, d_grad_.size()*sizeof(real));
   CudabinaryLogistic<<<pathToRoot.size(), args_->dim, 0, stream_>>>(
     thrust::raw_pointer_cast(d_target_.data()),
     thrust::raw_pointer_cast(d_label_.data()),
@@ -331,6 +332,7 @@ void CudaModel::oneVsAll(int32_t* d_target, int32_t d_target_n, real lr) {
     osz_);
   cudaStreamSynchronize(stream_);
 
+  cudaMemset(thrust::raw_pointer_cast(d_grad_.data()), 0, d_grad_.size()*sizeof(real));
   CudabinaryLogistic<<<d_oneVsAll_target_->size(), args_->dim, 0, stream_>>>(
     thrust::raw_pointer_cast(d_oneVsAll_target_->data()),
     thrust::raw_pointer_cast(d_label_.data()),
