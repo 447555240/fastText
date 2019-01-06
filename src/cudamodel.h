@@ -30,15 +30,19 @@ class CudaModel : public Model {
   virtual real getLoss();
 
  protected:
-  void computeLoss(
-    const std::vector<int32_t>& targets,
-    int32_t targetIndex,
+  void computeLoss(int32_t target,
+    int32_t* d_target, int32_t d_target_n,
     real lr);
   void negativeSampling(int32_t target, real lr);
   void hierarchicalSoftmax(int32_t target, real lr);
   void softmax(int32_t target, real lr); 
-  void oneVsAll(const std::vector<int32_t>& targets, real lr);
-  void computeInput(thrust::device_vector<int32_t>& d_input);
+  void oneVsAll(int32_t* d_target, int32_t d_target_n, real lr);
+  void computeInput(int32_t* d_input, int32_t d_input_n);
+
+ private:
+  void flush();
+  void update_internal(int32_t* d_input, int32_t d_input_n,
+    int32_t* d_target, int32_t d_target_n, int32_t target, real lr);
 
  protected:
   static std::mutex initmtx_;
@@ -65,6 +69,7 @@ class CudaModel : public Model {
   thrust::host_vector<int32_t> targetbuf_;
   thrust::host_vector<int32_t> targetbufpos_;
   int32_t targetpos_;
+  thrust::host_vector<int32_t> target_;
   thrust::host_vector<real> lrbuf_;
 
   cudaStream_t stream_;

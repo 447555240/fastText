@@ -43,7 +43,7 @@ Args::Args() {
   qnorm = false;
   cutoff = 0;
   dsub = 2;
-  batchsize = 10000;
+  batchsize = 1000;
 }
 
 std::string Args::lossToString(loss_name ln) const {

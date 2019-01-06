@@ -31,7 +31,9 @@ CudaModel::CudaModel(
     d_hidden_(args->dim, 0.0),
     d_output_(wo->size(0), 0.0),
     d_softmax_output_(wo->size(0), 0.0),
-    d_grad_(args->dim, 0.0) {
+    d_grad_(args->dim, 0.0),
+    inputpos_(0),
+    targetpos_(0) {
   std::lock_guard<std::mutex> lck(initmtx_);
   if( !inited_ ) {
     d_wi_ = new thrust::device_vector<real>(wi_->vector());
@@ -68,12 +70,11 @@ CudaModel::~CudaModel() {
 }
 
 real CudaModel::getLoss() {
-  if( ++nexamples_%100 == 0 ) {
+  if( ++nexamples_%1000 == 0 ) {
     thrust::host_vector<real> loss(1, 0.0);
     thrust::host_vector<unsigned long long int> nexamples(1, 1);
     thrust::copy(d_total_loss_->begin(), d_total_loss_->end(), loss.begin());
     thrust::copy(d_nexamples_->begin(), d_nexamples_->end(), nexamples.begin());
-    //printf("\navg loss:%f, total loss:%f, counter:%u\n", loss_, loss[0], nexamples[0]);
     loss_ = loss[0] / nexamples[0];
   }
   return loss_;
@@ -272,7 +273,6 @@ void CudaupdateOutput(real* grad, real* wo, real* hidden, real* softmax_output, 
 
   if( blockIdx.x==0 && blockIdx.y==0 && threadIdx.x==0 ) {
     atomicAdd(totalloss, -CudaLog(t_log, softmax_output[target]));
-    //printf("\ntotal loss:%f, loss: %f, target:%d, softmax_value:%f\n", *totalloss, -CudaLog(t_log, softmax_output[target]), target, softmax_output[target]);
   }
 
   real label = (output_idx==target)?1.0:0.0;
@@ -320,15 +320,13 @@ void CudaUpdateOnVsAllLabel(const int32_t* target, const size_t target_n, Bool* 
     label[target[idx]] = 1;
 }
 
-void CudaModel::oneVsAll(const std::vector<int32_t>& targets, real lr) {
-  thrust::device_vector<int32_t> d_targets = targets;
-  int threadCnt = std::min<size_t>(256, targets.size());
-  int blockCnt = (targets.size()+threadCnt-1)/threadCnt;
+void CudaModel::oneVsAll(int32_t* d_target, int32_t d_target_n, real lr) {
+  int threadCnt = std::min<size_t>(1024, d_target_n);
+  int blockCnt = (d_target_n+threadCnt-1)/threadCnt;
   thrust::host_vector<Bool> h_label(osz_, 0);
   d_label_ = h_label;
   CudaUpdateOnVsAllLabel<<<blockCnt, threadCnt, 0, stream_>>>(
-    thrust::raw_pointer_cast(d_targets.data()),
-    targets.size(),
+    d_target, d_target_n,
     thrust::raw_pointer_cast(d_label_.data()),
     osz_);
   cudaStreamSynchronize(stream_);
@@ -347,17 +345,17 @@ void CudaModel::oneVsAll(const std::vector<int32_t>& targets, real lr) {
 }
 
 void CudaModel::computeLoss(
-    const std::vector<int32_t>& targets,
-    int32_t targetIndex,
+    int32_t target,
+    int32_t* d_target, int32_t d_target_n,
     real lr) {
   if (args_->loss == loss_name::ns) {
-    negativeSampling(targets[targetIndex], lr);
+    negativeSampling(target, lr);
   } else if (args_->loss == loss_name::hs) {
-    hierarchicalSoftmax(targets[targetIndex], lr);
+    hierarchicalSoftmax(target, lr);
   } else if (args_->loss == loss_name::softmax) {
-    softmax(targets[targetIndex], lr);
+    softmax(target, lr);
   } else if (args_->loss == loss_name::ova) {
-    oneVsAll(targets, lr);
+    oneVsAll(d_target, d_target_n, lr);
   } else {
     throw std::invalid_argument("Unhandled loss function for this model.");
   }
@@ -370,7 +368,6 @@ void CudacomputeInput(int32_t* input, size_t input_n, real* grad, real* wi, unsi
 
   if( blockIdx.x==0 && threadIdx.x==0 ) {
     atomicAdd(nexamples, 1);
-    //printf("\ncounter: %u\n", *nexamples);
   }
   if( is_sup )
     grad[grad_idx] /= (real)(input_n);
@@ -379,10 +376,9 @@ void CudacomputeInput(int32_t* input, size_t input_n, real* grad, real* wi, unsi
   wi[input[input_idx]*blockDim.x+grad_idx] += grad[grad_idx];
 }
 
-void CudaModel::computeInput(thrust::device_vector<int32_t>& d_input) {
-  CudacomputeInput<<<d_input.size(), args_->dim, 0, stream_>>>(
-    thrust::raw_pointer_cast(d_input.data()),
-    d_input.size(),
+void CudaModel::computeInput(int32_t* d_input, int32_t d_input_n) {
+  CudacomputeInput<<<d_input_n, args_->dim, 0, stream_>>>(
+    d_input, d_input_n,
     thrust::raw_pointer_cast(d_grad_.data()),
     thrust::raw_pointer_cast(d_wi_->data()),
     thrust::raw_pointer_cast(d_nexamples_->data()),
@@ -395,49 +391,93 @@ void CudaModel::update(
     const std::vector<int32_t>& targets,
     int32_t targetIndex,
     real lr) {
-  if (input.size() == 0) {
+  if (input.size() == 0 || targets.size()==0 ) {
     return;
   }
 
+  inputbuf_.insert(inputbuf_.end(), input.begin(), input.end());
+  inputpos_ += input.size();
+  inputbufpos_.push_back(inputpos_);
+  if(args_->loss == loss_name::ova) {
+    targetbuf_.insert(targetbuf_.end(), targets.begin(), targets.end());
+    targetpos_ += targets.size();
+    targetbufpos_.push_back(targetpos_);
+  } else {
+    target_.push_back(targets[targetIndex]);
+  }
+  lrbuf_.push_back(lr);
+
+  if( inputbufpos_.size() >= args_->batchsize )
+    flush();
+}
+
+void CudaModel::flush() {
+  size_t cur_input = 0;
+  size_t cur_target = 0;
+  thrust::device_vector<int32_t> d_inputbuf = inputbuf_;
+  thrust::device_vector<int32_t> d_targetbuf = targetbuf_;
+  int32_t* p_input = thrust::raw_pointer_cast(d_inputbuf.data());
+  int32_t* p_target = thrust::raw_pointer_cast(d_targetbuf.data());
+  thrust::host_vector<int32_t>::const_iterator it_inputpos(inputbufpos_.begin()), it_inputposend(inputbufpos_.end());
+  thrust::host_vector<int32_t>::const_iterator it_targetpos(targetbufpos_.begin());
+  thrust::host_vector<int32_t>::const_iterator it_target(target_.begin());
+  thrust::host_vector<real>::const_iterator it_lr(lrbuf_.begin());
+  while( it_inputpos != it_inputposend ) {
+    int32_t* d_input = p_input + cur_input;
+    int32_t* d_target = p_target + cur_target;
+    int32_t d_input_n = *it_inputpos - cur_input;
+    real lr = *it_lr;
+    int32_t d_target_n = 0;
+    int32_t target = 0;
+    if( args_->loss==loss_name::ova )
+      d_target_n = *it_targetpos - cur_target;
+    else
+      target = *it_target;
+
+    update_internal(d_input, d_input_n, d_target, d_target_n, target, lr);
+
+    cur_input += d_input_n;
+    cur_target += d_target_n;
+    it_inputpos++;
+    if( args_->loss==loss_name::ova )
+      it_targetpos++;
+    else
+      it_target++;
+    it_lr++;
+  }
+
+  inputpos_ = 0;
+  targetpos_ = 0;
+  inputbuf_.clear();
+  targetbuf_.clear();
+  inputbufpos_.clear();
+  targetbufpos_.clear();
+  target_.clear();
+  lrbuf_.clear();
+}
+
+void CudaModel::update_internal(
+    int32_t* d_input, int32_t d_input_n,
+    int32_t* d_target, int32_t d_target_n,
+    int32_t target,
+    real lr) {
   // Get sum of input to hidden
-  d_input_ = input;
-  cudaMemset(thrust::raw_pointer_cast(d_hidden_.data()), 0, d_input_.size()*sizeof(real));
-  dim3 DimBlock(std::min<int>(1024, input.size()), 1, 1);
-  dim3 DimGrid(args_->dim, (input.size()+DimBlock.x-1)/DimBlock.x, 1);
+  cudaMemset(thrust::raw_pointer_cast(d_hidden_.data()), 0, d_hidden_.size()*sizeof(real));
+  dim3 DimBlock(std::min<int32_t>(1024, d_input_n), 1, 1);
+  dim3 DimGrid(args_->dim, (d_input_n+DimBlock.x-1)/DimBlock.x, 1);
   CudacomputeHidden<<<DimGrid, DimBlock, 0, stream_>>>(
-    thrust::raw_pointer_cast(d_input_.data()),
-    d_input_.size(),
+    d_input, d_input_n,
     thrust::raw_pointer_cast(d_hidden_.data()),
     thrust::raw_pointer_cast(d_wi_->data()));
   cudaStreamSynchronize(stream_);
 
   // Average hidden
-  CudaAverageHidden<<<1, args_->dim, 0, stream_>>>(input.size(), thrust::raw_pointer_cast(d_hidden_.data()));
+  CudaAverageHidden<<<1, args_->dim, 0, stream_>>>(d_input_n, thrust::raw_pointer_cast(d_hidden_.data()));
   cudaStreamSynchronize(stream_);
 
-  //Model::computeHidden(input, hidden_);
-  //verify("after computeHidden");
+  computeLoss(target, d_target, d_target_n, lr);
 
-  if (targetIndex == kAllLabelsAsTarget) {
-    computeLoss(targets, -1, lr);
-  } else {
-    assert(targetIndex >= 0);
-    assert(targetIndex < osz_);
-    computeLoss(targets, targetIndex, lr);
-  }
-
-  //Model::computeLoss(targets, targetIndex, lr);
-  //verify("after computeLoss");
-
-  computeInput(d_input_);
-
-  /*if (args_->model == model_name::sup) {
-    grad_.mul(1.0 / input.size());
-  }
-  for (auto it = input.cbegin(); it != input.cend(); ++it) {
-    wi_->addRow(grad_, *it, 1.0);
-  }
-  verify("after computeInput");*/
+  computeInput(d_input, d_input_n);
 }
 
 } // namespace fasttext
