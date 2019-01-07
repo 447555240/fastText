@@ -1,3 +1,15 @@
+Just git clone https://github.com/panqingfeng/fastText.git 
+```
+make -f Makefile.cuda
+```
+then
+```
+$ ./fasttext supervised -input train.txt -output model -thread 4 
+```
+You can change (cpu) thread number to what ever you like, but 4 is enough, because gpu has done most of the jobs.
+Enjoy it
+
+
 # fastText
 [fastText](https://fasttext.cc/) is a library for efficient learning of word representations and sentence classification.
 
