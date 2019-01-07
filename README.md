@@ -4,9 +4,8 @@ make -f Makefile.cuda
 ```
 then
 ```
-$ ./fasttext supervised -input train.txt -output model -thread 4 
+$ ./fasttext supervised -input train.txt -output model
 ```
-You can change (cpu) thread number to what ever you like, but 4 is enough, because gpu has done most of the jobs.
 Enjoy it
 
 

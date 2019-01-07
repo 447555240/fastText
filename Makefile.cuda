@@ -20,8 +20,8 @@ coverage: CXXFLAGS += -O0 -fno-inline -fprofile-arcs --coverage
 coverage: NVCCFLAGS = --compiler-options -pthread -std=c++11
 coverage: fasttext
 
-debug: CXXFLAGS += -g -O0 -fno-inline
-debug: NVCCFLAGS = --compiler-options -pthread -std=c++11 -G -g
+debug: CXXFLAGS += -O3 -funroll-loops
+debug: NVCCFLAGS = --compiler-options -pthread -std=c++11 -G -g -D_COMPARE_WITH_CPU_
 debug: fasttext
 
 args.o: src/args.cc src/args.h
