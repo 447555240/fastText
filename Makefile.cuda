@@ -21,8 +21,12 @@ coverage: NVCCFLAGS = --compiler-options -pthread -std=c++11
 coverage: fasttext
 
 debug: CXXFLAGS += -O3 -funroll-loops
-debug: NVCCFLAGS = --compiler-options -pthread -std=c++11 -G -g -D_COMPARE_WITH_CPU_
+debug: NVCCFLAGS = --compiler-options -pthread -std=c++11 -G -g
 debug: fasttext
+
+test: CXXFLAGS += -O3 -funroll-loops
+test: NVCCFLAGS = --compiler-options -pthread -std=c++11 -D_COMPARE_WITH_CPU_
+test: fasttext
 
 args.o: src/args.cc src/args.h
 	$(CXX) $(CXXFLAGS) -c src/args.cc

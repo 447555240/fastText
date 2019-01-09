@@ -38,6 +38,7 @@ class CudaModel : public Model {
   void softmax(int32_t target, real lr); 
   void oneVsAll(int32_t* d_target, int32_t d_target_n, real lr);
   void computeInput(int32_t* d_input, int32_t d_input_n);
+  void computeHidden(int32_t* d_input, int32_t d_input_n);
 
  private:
   void flush();
@@ -63,6 +64,8 @@ class CudaModel : public Model {
   thrust::device_vector<Bool> d_label_;
   thrust::device_vector<int32_t> d_target_;
 
+  thrust::device_vector<char> d_hidden_reduce_workspace_;
+
   thrust::host_vector<int32_t> inputbuf_;
   thrust::host_vector<int32_t> inputbufpos_;
   int32_t inputpos_;
@@ -74,7 +77,9 @@ class CudaModel : public Model {
 
   cudaStream_t stream_;
   cudnnHandle_t cudnn_;
-  cudnnTensorDescriptor_t cudnn_desc_;
+  cudnnTensorDescriptor_t cudnn_output_desc_;
+  cudnnTensorDescriptor_t cudnn_hidden_desc_;
+  cudnnTensorDescriptor_t cudnn_wi_desc_;
 };
 
 } // namespace fasttext
