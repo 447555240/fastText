@@ -81,11 +81,9 @@ real CudaModel::getLoss() {
 #ifndef _COMPARE_WITH_CPU_
   nexamples_++;
 #endif
-  if( nexamples_%100 == 0 ) {
-    thrust::host_vector<real> loss(*d_total_loss_);
-    thrust::host_vector<unsigned long long int> nexamples(*d_nexamples_);
-    loss_ = loss[0] / nexamples[0];
-  }
+  thrust::host_vector<real> loss(*d_total_loss_);
+  thrust::host_vector<unsigned long long int> nexamples(*d_nexamples_);
+  loss_ = loss[0] / nexamples[0];
   return loss_;
 }
 
@@ -268,10 +266,19 @@ void CudaModel::hierarchicalSoftmax(int32_t target, real lr) {
 
 __global__
 void CudacomputeOutput(real* hidden, real* output, size_t output_n, real* wo) {
-  int hidden_idx = blockIdx.x;
-  int output_idx = blockIdx.y*blockDim.x + threadIdx.x;
-  if( output_idx < output_n )
-    atomicAdd(&output[output_idx], wo[output_idx*gridDim.x+hidden_idx]*hidden[hidden_idx]);
+  int output_idx = blockIdx.y*gridDim.x + blockIdx.x;
+  int hidden_idx = threadIdx.x;
+  __shared__ real sum;
+  if( threadIdx.x==0 ) {
+    sum = 0;
+  }
+  __syncthreads();
+  if( output_idx < output_n ) {
+    atomicAdd(&sum, wo[output_idx*blockDim.x+hidden_idx]*hidden[hidden_idx]);
+    __syncthreads();
+    if( threadIdx.x==0 )
+      atomicAdd(&output[output_idx], sum);
+  }
 }
 
 __global__
@@ -280,8 +287,11 @@ void CudaupdateOutput(real* grad, real* wo, real* hidden, real* softmax_output, 
   int output_idx = blockIdx.y*blockDim.x + threadIdx.x;
 
   __shared__ real sum;
-  if( threadIdx.x==0 )
+  __shared__ real shared_hidden;
+  if( threadIdx.x==0 ) {
     sum = 0.0;
+    shared_hidden = hidden[hidden_idx];
+  }
   __syncthreads();
 
   if( blockIdx.x==0 && blockIdx.y==0 && threadIdx.x==0 ) {
@@ -292,7 +302,7 @@ void CudaupdateOutput(real* grad, real* wo, real* hidden, real* softmax_output, 
     real label = (output_idx==target)?1.0:0.0;
     real alpha = lr * (label - softmax_output[output_idx]);
     atomicAdd(&sum, alpha*wo[output_idx*gridDim.x+hidden_idx]);
-    atomicAdd(&wo[output_idx*gridDim.x+hidden_idx], alpha*hidden[hidden_idx]);
+    atomicAdd(&wo[output_idx*gridDim.x+hidden_idx], alpha*shared_hidden);
   }
   __syncthreads();
 
@@ -301,8 +311,8 @@ void CudaupdateOutput(real* grad, real* wo, real* hidden, real* softmax_output, 
 }
 
 void CudaModel::softmax(int32_t target, real lr) {
-  dim3 DimBlock(256, 1, 1);
-  dim3 DimGrid(args_->dim, (output_.size()+DimBlock.x-1)/DimBlock.x, 1);
+  dim3 DimBlock(args_->dim, 1, 1);
+  dim3 DimGrid(256, (output_.size()+255)/256, 1);
   cudaMemset(thrust::raw_pointer_cast(d_output_.data()), 0, d_output_.size()*sizeof(real));
   CudacomputeOutput<<<DimGrid, DimBlock, 0, stream_>>>(
     thrust::raw_pointer_cast(d_hidden_.data()),
@@ -316,7 +326,9 @@ void CudaModel::softmax(int32_t target, real lr) {
     &one, cudnn_output_desc_, thrust::raw_pointer_cast(d_output_.data()), 
     &zero, cudnn_output_desc_, thrust::raw_pointer_cast(d_softmax_output_.data()));
 
-  CudaupdateOutput<<<DimGrid, DimBlock, 0, stream_>>>(
+  dim3 DimBlock2(256, 1, 1);
+  dim3 DimGrid2(args_->dim, (output_.size()+255)/256, 1);
+  CudaupdateOutput<<<DimGrid2, DimBlock2, 0, stream_>>>(
     thrust::raw_pointer_cast(d_grad_.data()),
     thrust::raw_pointer_cast(d_wo_->data()),
     thrust::raw_pointer_cast(d_hidden_.data()),
@@ -441,6 +453,7 @@ void CudaModel::flush() {
   thrust::device_vector<int32_t> d_targetbuf(targetbuf_.size());
   int32_t* p_input = thrust::raw_pointer_cast(d_inputbuf.data());
   int32_t* p_target = thrust::raw_pointer_cast(d_targetbuf.data());
+  cudaStreamSynchronize(stream_);
   cudaMemcpyAsync(p_input, inputbuf_.data(), inputbuf_.size()*sizeof(int32_t), cudaMemcpyHostToDevice, stream_);
   cudaMemcpyAsync(p_target, targetbuf_.data(), targetbuf_.size()*sizeof(int32_t), cudaMemcpyHostToDevice, stream_);
   thrust::host_vector<int32_t>::const_iterator it_inputpos(inputbufpos_.begin()), it_inputposend(inputbufpos_.end());
