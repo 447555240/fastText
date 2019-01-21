@@ -20,7 +20,7 @@ coverage: CXXFLAGS += -O0 -fno-inline -fprofile-arcs --coverage
 coverage: NVCCFLAGS = --compiler-options -pthread -std=c++11
 coverage: fasttext
 
-debug: CXXFLAGS += -O3 -funroll-loops
+debug: CXXFLAGS += -g -funroll-loops
 debug: NVCCFLAGS = --compiler-options -pthread -std=c++11 -G -g
 debug: fasttext
 
@@ -59,7 +59,7 @@ fasttext.o: src/fasttext.cc src/*.h
 	$(CXX) $(CXXFLAGS) $(INCLUDES) -c src/fasttext.cc
 
 fasttext: $(OBJS) src/fasttext.cc
-	$(NVCC) $(NVCCFLAGS) $(OBJS) -lcudnn src/main.cc -o fasttext
+	$(NVCC) $(NVCCFLAGS) $(OBJS) -lcudnn -lcublas src/main.cc -o fasttext
 
 cudamodel.o: src/cudamodel.cu src/*.h
 	$(NVCC) $(NVCCFLAGS) $(INCLUDES) -c src/cudamodel.cu

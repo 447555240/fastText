@@ -2,6 +2,7 @@
 
 #include <mutex>
 #include <cudnn.h>
+#include "cublas_v2.h"
 #include "model.h"
 #include "thrust/device_vector.h"
 #include "thrust/host_vector.h"
@@ -41,6 +42,8 @@ class CudaModel : public Model {
   void computeHidden(int32_t* d_input, int32_t d_input_n);
 
  private:
+  void FullyConnectedForward();
+  void FullyConnectedBackward(int32_t target, real lr);
   void flush();
   void update_internal(int32_t* d_input, int32_t d_input_n,
     int32_t* d_target, int32_t d_target_n, int32_t target, real lr);
@@ -59,6 +62,7 @@ class CudaModel : public Model {
   thrust::device_vector<real> d_hidden_;
   thrust::device_vector<real> d_output_;
   thrust::device_vector<real> d_softmax_output_;
+  thrust::device_vector<real> d_output_diff_;
   thrust::device_vector<real> d_grad_;
   thrust::device_vector<int32_t> d_input_;
   thrust::device_vector<Bool> d_label_;
@@ -80,6 +84,7 @@ class CudaModel : public Model {
   cudnnTensorDescriptor_t cudnn_output_desc_;
   cudnnTensorDescriptor_t cudnn_hidden_desc_;
   cudnnTensorDescriptor_t cudnn_wi_desc_;
+  cublasHandle_t cublas_;
 };
 
 } // namespace fasttext
