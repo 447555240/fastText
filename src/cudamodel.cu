@@ -7,10 +7,6 @@
 
 namespace fasttext {
 
-constexpr int64_t SIGMOID_TABLE_SIZE = 512;
-constexpr int64_t MAX_SIGMOID = 8;
-constexpr int64_t LOG_TABLE_SIZE = 512;
-
 static const float one = 1.0;
 static const float zero = 0.0;
 std::mutex CudaModel::initmtx_;
@@ -159,11 +155,13 @@ void CudacomputeHidden(int32_t* input, size_t input_n, real* hidden, real* wi) {
       atomicAdd(&hidden[hidden_idx], sum);
   }
 }
+
 __global__
 void CudaAverageHidden(size_t input_n, real* hidden) {
   hidden[threadIdx.x] /= input_n;
 }
 
+constexpr int64_t LOG_TABLE_SIZE = 512;
 __device__ __forceinline__ 
 real CudaLog(const real* t_log, real x) {
   if (x > 1.0) {
@@ -173,6 +171,8 @@ real CudaLog(const real* t_log, real x) {
   return t_log[i];
 }
 
+constexpr int64_t SIGMOID_TABLE_SIZE = 512;
+constexpr int64_t MAX_SIGMOID = 8;
 __device__ __forceinline__ 
 real CudaSigmoid(const real* t_sigmoid, real x) {
   if (x < -MAX_SIGMOID) {
@@ -188,7 +188,7 @@ real CudaSigmoid(const real* t_sigmoid, real x) {
 
 __global__
 void CudabinaryLogistic(int32_t* target, Bool* label, real lr, 
-  real* hidden, real* wo, real* grad, real* totalloss,
+  real* hidden, real* wo, real* grad, real* totalloss, unsigned long long int* nexamples,
   const real* t_log, const real* t_sigmoid) {
   int target_idx = blockIdx.x;
   int hidden_idx = threadIdx.x;
@@ -196,11 +196,15 @@ void CudabinaryLogistic(int32_t* target, Bool* label, real lr,
   __shared__ real dotRow;
   __shared__ real score;
   __shared__ real alpha;
-  if( threadIdx.x==0 )
+  __shared__ int32_t target_value;
+  if( threadIdx.x==0 ) {
     dotRow = 0.0;
+    target_value = target[target_idx]*blockDim.x;
+  }
   __syncthreads();
 
-  atomicAdd(&dotRow, wo[target[target_idx]*blockDim.x+hidden_idx]*hidden[hidden_idx]);
+  int32_t wo_idx = target_value+hidden_idx;
+  atomicAdd(&dotRow, wo[wo_idx]*hidden[hidden_idx]);
   __syncthreads();
 
   if( threadIdx.x==0 ) {
@@ -209,14 +213,17 @@ void CudabinaryLogistic(int32_t* target, Bool* label, real lr,
   }
   __syncthreads();
 
-  atomicAdd(&grad[hidden_idx], alpha * wo[target[target_idx]*blockDim.x+hidden_idx]);
-  wo[target[target_idx]*blockDim.x+hidden_idx] += alpha * hidden[hidden_idx];
+  atomicAdd(&grad[hidden_idx], alpha * wo[wo_idx]);
+  atomicAdd(&wo[wo_idx], alpha * hidden[hidden_idx]); 
 
   if( threadIdx.x==0 ) {
     if( label[target_idx] )
       atomicAdd(totalloss, -CudaLog(t_log, score));
     else
       atomicAdd(totalloss, -CudaLog(t_log, 1.0-score));
+
+    if( blockIdx.x==0 )
+      atomicAdd(nexamples, 1);
   }
 }
 
@@ -244,6 +251,7 @@ void CudaModel::negativeSampling(int32_t target, real lr) {
     thrust::raw_pointer_cast(d_wo_->data()),
     thrust::raw_pointer_cast(d_grad_.data()),
     thrust::raw_pointer_cast(d_total_loss_->data()),
+    thrust::raw_pointer_cast(d_nexamples_->data()),
     thrust::raw_pointer_cast(d_t_log_->data()),
     thrust::raw_pointer_cast(d_t_sigmoid_->data()));
 }
@@ -267,6 +275,7 @@ void CudaModel::hierarchicalSoftmax(int32_t target, real lr) {
     thrust::raw_pointer_cast(d_wo_->data()),
     thrust::raw_pointer_cast(d_grad_.data()),
     thrust::raw_pointer_cast(d_total_loss_->data()),
+    thrust::raw_pointer_cast(d_nexamples_->data()),
     thrust::raw_pointer_cast(d_t_log_->data()),
     thrust::raw_pointer_cast(d_t_sigmoid_->data()));
 }
@@ -387,6 +396,7 @@ void CudaModel::oneVsAll(int32_t* d_target, int32_t d_target_n, real lr) {
     thrust::raw_pointer_cast(d_wo_->data()),
     thrust::raw_pointer_cast(d_grad_.data()),
     thrust::raw_pointer_cast(d_total_loss_->data()),
+    thrust::raw_pointer_cast(d_nexamples_->data()),
     thrust::raw_pointer_cast(d_t_log_->data()),
     thrust::raw_pointer_cast(d_t_sigmoid_->data()));
 }
@@ -416,7 +426,12 @@ void CudacomputeInput(int32_t* input, size_t input_n, real* grad, real* wi, unsi
   if( is_sup )
     grad[grad_idx] /= (real)(input_n);
 
-  wi[input[input_idx]*blockDim.x+grad_idx] += grad[grad_idx];
+  __shared__ int32_t input_value;
+  if( threadIdx.x==0 )
+    input_value = input[input_idx]*blockDim.x;
+  __syncthreads();
+
+  wi[input_value+grad_idx] += grad[grad_idx];
 }
 
 void CudaModel::computeInput(int32_t* d_input, int32_t d_input_n) {
