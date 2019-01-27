@@ -6,6 +6,7 @@
 #include "model.h"
 #include "thrust/device_vector.h"
 #include "thrust/host_vector.h"
+#include <thrust/system/cuda/experimental/pinned_allocator.h>
 
 namespace fasttext {
 
@@ -31,22 +32,21 @@ class CudaModel : public Model {
   virtual real getLoss();
 
  protected:
-  void computeLoss(int32_t target,
-    int32_t* d_target, int32_t d_target_n,
-    real lr);
-  void negativeSampling(int32_t target, real lr);
-  void hierarchicalSoftmax(int32_t target, real lr);
-  void softmax(int32_t target, real lr); 
-  void oneVsAll(int32_t* d_target, int32_t d_target_n, real lr);
-  void computeInput(int32_t* d_input, int32_t d_input_n);
-  void computeHidden(int32_t* d_input, int32_t d_input_n);
+  void computeLoss(int32_t target, int32_t* d_target, int32_t d_target_n,
+    real* hidden, real* grad, real lr);
+  void negativeSampling(int32_t target, real* hidden, real* grad, real lr);
+  void hierarchicalSoftmax(int32_t target, real* hidden, real* grad, real lr);
+  void softmax(int32_t target, real* hidden, real* grad, real lr); 
+  void oneVsAll(int32_t* d_target, int32_t d_target_n, real* hidden, real* grad, real lr);
+  void computeInput(int32_t* d_input, int32_t d_input_n, real* grad);
+  void computeHidden(int32_t* d_input, int32_t d_input_n, real* hidden);
 
  private:
-  void FullyConnectedForward();
-  void FullyConnectedBackward(int32_t target, real lr);
+  void FullyConnectedForward(real* hidden);
+  void FullyConnectedBackward(int32_t target, real* hidden, real* grad, real lr);
   void flush();
   void update_internal(int32_t* d_input, int32_t d_input_n,
-    int32_t* d_target, int32_t d_target_n, int32_t target, real lr);
+    int32_t* d_target, int32_t d_target_n, int32_t target, real* p_hidden, real* p_grad, real lr);
 
  protected:
   static std::mutex initmtx_;
@@ -59,31 +59,25 @@ class CudaModel : public Model {
   static thrust::device_vector<int32_t>* d_oneVsAll_target_;
   static thrust::device_vector<real>* d_total_loss_;
   static thrust::device_vector<unsigned long long int>* d_nexamples_;
-  thrust::device_vector<real> d_hidden_;
   thrust::device_vector<real> d_output_;
   thrust::device_vector<real> d_softmax_output_;
   thrust::device_vector<real> d_output_diff_;
-  thrust::device_vector<real> d_grad_;
   thrust::device_vector<int32_t> d_input_;
   thrust::device_vector<Bool> d_label_;
   thrust::device_vector<int32_t> d_target_;
 
-  thrust::device_vector<char> d_hidden_reduce_workspace_;
-
-  thrust::host_vector<int32_t> inputbuf_;
-  thrust::host_vector<int32_t> inputbufpos_;
+  thrust::host_vector<int32_t, thrust::cuda::experimental::pinned_allocator<int32_t> > inputbuf_;
+  thrust::host_vector<int32_t, thrust::cuda::experimental::pinned_allocator<int32_t> > inputbufpos_;
   int32_t inputpos_;
-  thrust::host_vector<int32_t> targetbuf_;
-  thrust::host_vector<int32_t> targetbufpos_;
+  thrust::host_vector<int32_t, thrust::cuda::experimental::pinned_allocator<int32_t> > targetbuf_;
+  thrust::host_vector<int32_t, thrust::cuda::experimental::pinned_allocator<int32_t> > targetbufpos_;
   int32_t targetpos_;
-  thrust::host_vector<int32_t> target_;
-  thrust::host_vector<real> lrbuf_;
+  thrust::host_vector<int32_t, thrust::cuda::experimental::pinned_allocator<int32_t> > target_;
+  thrust::host_vector<real, thrust::cuda::experimental::pinned_allocator<real> > lrbuf_;
 
   cudaStream_t stream_;
   cudnnHandle_t cudnn_;
   cudnnTensorDescriptor_t cudnn_output_desc_;
-  cudnnTensorDescriptor_t cudnn_hidden_desc_;
-  cudnnTensorDescriptor_t cudnn_wi_desc_;
   cublasHandle_t cublas_;
 };
 
