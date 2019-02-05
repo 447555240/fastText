@@ -33,7 +33,9 @@ CudaModel::CudaModel(
     targetpos_(0) {
   std::lock_guard<std::mutex> lck(initmtx_);
   if( !inited_ ) {
+    printf("Copy input weight vetor with size %d bytes, please make sure you have got enough gpu memory\n", wi_->vector().size()*sizeof(real));
     d_wi_ = new thrust::device_vector<real>(wi_->vector());
+    printf("Copy output weight vetor with size %d bytes, please make sure you have got enough gpu memory\n", wo_->vector().size()*sizeof(real));
     d_wo_ = new thrust::device_vector<real>(wo_->vector());
     d_t_sigmoid_ = new thrust::device_vector<real>(t_sigmoid_);
     d_t_log_ = new thrust::device_vector<real>(t_log_);
@@ -100,35 +102,52 @@ const real epsilon = 0.00001f;
 void CudaModel::verify(const char* prefix) {
   assert(args_->thread==1);
   printf("\n");
+  std::vector<real> h_hidden(args_->dim, 0.0);
+  cudaMemcpy(h_hidden.data(), d_hidden_, args_->dim*sizeof(real), cudaMemcpyDeviceToHost);
+  cudaStreamSynchronize(stream_);
+  for(size_t i=0; i<hidden_.size(); i++)
+    if( fabs(h_hidden[i]-hidden_[i])>epsilon )
+      printf("%s hidden %lu not match: (h)%f (d)%f\n", prefix, i, hidden_[i], h_hidden[i]);
+  std::vector<real> h_grad(args_->dim, 0.0);
+  cudaMemcpy(h_grad.data(), d_grad_, args_->dim*sizeof(real), cudaMemcpyDeviceToHost);
+  cudaStreamSynchronize(stream_);
+  for(size_t i=0; i<grad_.size(); i++)
+    if( fabs(h_grad[i]-grad_[i])>epsilon )
+      printf("%s grad %lu not match: (h)%f (d)%f\n", prefix, i, grad_[i], h_grad[i]);
   thrust::host_vector<real> h_output(args_->loss == loss_name::softmax?d_softmax_output_:d_output_);
+  cudaStreamSynchronize(stream_);
   for(size_t i=0; i<output_.size(); i++)
     if( fabs(h_output[i]-output_[i])>epsilon )
       printf("%s output %lu not match: (h)%f (d)%f\n", prefix, i, output_[i], h_output[i]);
   thrust::host_vector<real> h_wi(*d_wi_);
+  cudaStreamSynchronize(stream_);
   for(size_t i=0; i<wi_->vector().size(); i++)
     if( fabs(h_wi[i]-wi_->vector()[i])>epsilon )
       printf("%s wi %lu not match: (h)%f (d)%f\n", prefix, i, wi_->vector()[i], h_wi[i]);
   thrust::host_vector<real> h_wo(*d_wo_);
+  cudaStreamSynchronize(stream_);
   for(size_t i=0; i<wo_->vector().size(); i++)
     if( fabs(h_wo[i]-wo_->vector()[i])>epsilon )
       printf("%s wo %lu not match: (h)%f (d)%f\n", prefix, i, wo_->vector()[i], h_wo[i]);
   thrust::host_vector<real> loss(*d_total_loss_);
+  cudaStreamSynchronize(stream_);
   if( fabs(loss[0]-loss_)>epsilon )
     printf("loss not match: (h)%f, (d)%f\n", loss_, loss[0]);
   thrust::host_vector<unsigned long long int> nexamples(*d_nexamples_);
+  cudaStreamSynchronize(stream_);
   if( nexamples[0]!=nexamples_ )
     printf("samples not match: (h)%lu, (d)%lu\n", nexamples_, nexamples[0]);
   printf("\n%s end\n", prefix);
 }
 
 __global__
-void CudacomputeHidden(const int32_t* input, size_t input_n, real* hidden, real* wi) {
+void CudacomputeHidden(int32_t* input, size_t input_n, real* hidden, real* wi) {
   int input_idx = blockIdx.x;
   int hidden_idx = threadIdx.x;
 
   __shared__ int32_t input_col;
   if( threadIdx.x==0 )
-    input_col = input[input_idx];
+    input_col = input[input_idx]*blockDim.x;
   __syncthreads();
 
   atomicAdd(&hidden[hidden_idx], wi[input_col+hidden_idx]);
@@ -165,8 +184,8 @@ real CudaSigmoid(const real* t_sigmoid, real x) {
 }
 
 __global__
-void CudabinaryLogistic(const int32_t* target, const Bool* label, real lr, 
-  const real* hidden, real* wo, real* grad, real* totalloss, unsigned long long int* nexamples,
+void CudabinaryLogistic(int32_t* target, Bool* label, real lr, 
+  real* hidden, real* wo, real* grad, real* totalloss, unsigned long long int* nexamples,
   const real* t_log, const real* t_sigmoid) {
   int target_idx = blockIdx.x;
   int hidden_idx = threadIdx.x;
@@ -205,7 +224,7 @@ void CudabinaryLogistic(const int32_t* target, const Bool* label, real lr,
   }
 }
 
-void CudaModel::negativeSampling(int32_t target, real* hidden, real* grad, real lr) {
+void CudaModel::negativeSampling(int32_t target, real lr) {
   thrust::host_vector<Bool> h_target(args_->neg+1);
   thrust::host_vector<int32_t> h_label(args_->neg+1);
   for (int32_t n = 0; n <= args_->neg; n++) {
@@ -224,16 +243,16 @@ void CudaModel::negativeSampling(int32_t target, real* hidden, real* grad, real 
     thrust::raw_pointer_cast(d_target_.data()),
     thrust::raw_pointer_cast(d_label_.data()),
     lr,
-    hidden,
+    d_hidden_,
     thrust::raw_pointer_cast(d_wo_->data()),
-    grad,
+    d_grad_,
     thrust::raw_pointer_cast(d_total_loss_->data()),
     thrust::raw_pointer_cast(d_nexamples_->data()),
     thrust::raw_pointer_cast(d_t_log_->data()),
     thrust::raw_pointer_cast(d_t_sigmoid_->data()));
 }
 
-void CudaModel::hierarchicalSoftmax(int32_t target, real* hidden, real* grad, real lr) {
+void CudaModel::hierarchicalSoftmax(int32_t target, real lr) {
   const std::vector<bool>& binaryCode = codes[target];
   const std::vector<int32_t>& pathToRoot = paths[target];
   thrust::host_vector<int32_t> h_label(pathToRoot.size());
@@ -247,23 +266,23 @@ void CudaModel::hierarchicalSoftmax(int32_t target, real* hidden, real* grad, re
     thrust::raw_pointer_cast(d_target_.data()),
     thrust::raw_pointer_cast(d_label_.data()),
     lr, 
-    hidden,
+    d_hidden_,
     thrust::raw_pointer_cast(d_wo_->data()),
-    grad,
+    d_grad_,
     thrust::raw_pointer_cast(d_total_loss_->data()),
     thrust::raw_pointer_cast(d_nexamples_->data()),
     thrust::raw_pointer_cast(d_t_log_->data()),
     thrust::raw_pointer_cast(d_t_sigmoid_->data()));
 }
 
-void CudaModel::FullyConnectedForward(real* hidden) {
+void CudaModel::FullyConnectedForward() {
   int M = wo_->size(0);
   int N = wo_->size(1);
   cublasStatus_t stat = cublasSgemv(cublas_, CUBLAS_OP_T, 
     N, M,
     &one, 
     thrust::raw_pointer_cast(d_wo_->data()), N,
-    hidden, 1, 
+    d_hidden_, 1,
     &zero,
     thrust::raw_pointer_cast(d_output_.data()), 1);
   if( stat != CUBLAS_STATUS_SUCCESS ) {
@@ -273,7 +292,7 @@ void CudaModel::FullyConnectedForward(real* hidden) {
 }
 
 __global__
-void CudacomputeDiff(const real* softmax_output, size_t output_n, real* output_diff, unsigned long long int* nexamples, real* totalloss, const real* t_log, int32_t target, real lr) {
+void CudacomputeDiff(real* softmax_output, size_t output_n, real* output_diff, unsigned long long int* nexamples, real* totalloss, const real* t_log, int32_t target, real lr) {
   int output_idx = blockIdx.x*blockDim.x + threadIdx.x;
 
   if( threadIdx.x==0 && blockIdx.x==0 ) {
@@ -288,7 +307,7 @@ void CudacomputeDiff(const real* softmax_output, size_t output_n, real* output_d
 }
 
 __global__
-void CudaupdateOutput(real* grad, real* wo, const real* hidden, const real* output_diff, size_t output_n) {
+void CudaupdateOutput(real* grad, real* wo, real* hidden, real* output_diff, size_t output_n, real* totalloss, const real* t_log, int32_t target, real lr) {
   int hidden_idx = blockIdx.x;
   int output_idx = blockIdx.y*blockDim.x + threadIdx.x;
 
@@ -311,7 +330,7 @@ void CudaupdateOutput(real* grad, real* wo, const real* hidden, const real* outp
     atomicAdd(&grad[hidden_idx], sum);
 }
 
-void CudaModel::FullyConnectedBackward(int32_t target, real* hidden, real* grad, real lr) {
+void CudaModel::FullyConnectedBackward(int32_t target, real lr) {
   CudacomputeDiff<<<(d_softmax_output_.size()+255)/256, 256, 0, stream_>>>(
     thrust::raw_pointer_cast(d_softmax_output_.data()),
     d_softmax_output_.size(),
@@ -324,21 +343,24 @@ void CudaModel::FullyConnectedBackward(int32_t target, real* hidden, real* grad,
   dim3 DimBlock2(256, 1, 1);
   dim3 DimGrid2(args_->dim, (output_.size()+255)/256, 1);
   CudaupdateOutput<<<DimGrid2, DimBlock2, 0, stream_>>>(
-    grad,
+    d_grad_,
     thrust::raw_pointer_cast(d_wo_->data()),
-    hidden,
+    d_hidden_,
     thrust::raw_pointer_cast(d_output_diff_.data()),
-    d_output_diff_.size());
+    d_output_diff_.size(),
+    thrust::raw_pointer_cast(d_total_loss_->data()),
+    thrust::raw_pointer_cast(d_t_log_->data()),
+    target, lr);
 }
 
-void CudaModel::softmax(int32_t target, real* hidden, real* grad, real lr) {
-  FullyConnectedForward(hidden);
+void CudaModel::softmax(int32_t target, real lr) {
+  FullyConnectedForward();
    
   cudnnSoftmaxForward(cudnn_, cudnnSoftmaxAlgorithm_t::CUDNN_SOFTMAX_ACCURATE, cudnnSoftmaxMode_t::CUDNN_SOFTMAX_MODE_INSTANCE, 
     &one, cudnn_output_desc_, thrust::raw_pointer_cast(d_output_.data()), 
     &zero, cudnn_output_desc_, thrust::raw_pointer_cast(d_softmax_output_.data()));
 
-  FullyConnectedBackward(target, hidden, grad, lr);
+  FullyConnectedBackward(target, lr);
 }
 
 __global__
@@ -350,7 +372,7 @@ void CudaUpdateOnVsAllLabel(const int32_t* target, const size_t target_n, Bool* 
     label[target[idx]] = 1;
 }
 
-void CudaModel::oneVsAll(int32_t* d_target, int32_t d_target_n, real* hidden, real* grad, real lr) {
+void CudaModel::oneVsAll(int32_t* d_target, int32_t d_target_n, real lr) {
   int threadCnt = std::min<size_t>(1024, d_target_n);
   int blockCnt = (d_target_n+threadCnt-1)/threadCnt;
   thrust::host_vector<Bool> h_label(osz_, 0);
@@ -364,9 +386,9 @@ void CudaModel::oneVsAll(int32_t* d_target, int32_t d_target_n, real* hidden, re
     thrust::raw_pointer_cast(d_oneVsAll_target_->data()),
     thrust::raw_pointer_cast(d_label_.data()),
     lr,
-    hidden,
+    d_hidden_,
     thrust::raw_pointer_cast(d_wo_->data()),
-    grad,
+    d_grad_,
     thrust::raw_pointer_cast(d_total_loss_->data()),
     thrust::raw_pointer_cast(d_nexamples_->data()),
     thrust::raw_pointer_cast(d_t_log_->data()),
@@ -376,23 +398,22 @@ void CudaModel::oneVsAll(int32_t* d_target, int32_t d_target_n, real* hidden, re
 void CudaModel::computeLoss(
     int32_t target,
     int32_t* d_target, int32_t d_target_n,
-    real* hidden, real* grad,
     real lr) {
   if (args_->loss == loss_name::ns) {
-    negativeSampling(target, hidden, grad, lr);
+    negativeSampling(target, lr);
   } else if (args_->loss == loss_name::hs) {
-    hierarchicalSoftmax(target, hidden, grad, lr);
+    hierarchicalSoftmax(target, lr);
   } else if (args_->loss == loss_name::softmax) {
-    softmax(target, hidden, grad, lr);
+    softmax(target, lr);
   } else if (args_->loss == loss_name::ova) {
-    oneVsAll(d_target, d_target_n, hidden, grad, lr);
+    oneVsAll(d_target, d_target_n, lr);
   } else {
     throw std::invalid_argument("Unhandled loss function for this model.");
   }
 }
 
 __global__
-void CudacomputeInput(const int32_t* input, size_t input_n, real* grad, real* wi, unsigned long long int* nexamples, bool is_sup) {
+void CudacomputeInput(int32_t* input, size_t input_n, real* grad, real* wi, unsigned long long int* nexamples, bool is_sup) {
   int input_idx = blockIdx.x;
   int grad_idx = threadIdx.x;
 
@@ -407,10 +428,10 @@ void CudacomputeInput(const int32_t* input, size_t input_n, real* grad, real* wi
   wi[input_value+grad_idx] += grad[grad_idx];
 }
 
-void CudaModel::computeInput(int32_t* d_input, int32_t d_input_n, real* grad) {
+void CudaModel::computeInput(int32_t* d_input, int32_t d_input_n) {
   CudacomputeInput<<<d_input_n, args_->dim, 0, stream_>>>(
     d_input, d_input_n,
-    grad, 
+    d_grad_,
     thrust::raw_pointer_cast(d_wi_->data()),
     thrust::raw_pointer_cast(d_nexamples_->data()),
     args_->model==model_name::sup);
@@ -440,28 +461,29 @@ void CudaModel::update(
   if( inputbufpos_.size() >= args_->batchsize )
     flush();
 #ifdef _COMPARE_WITH_CPU_
-  // compute by gpu
-  flush();
-
   // compute by cpu
   Model::update(input, targets, targetIndex, lr);
-  
-  // compare
-  verify("after computeInput");
+
+  // compute by gpu and compare 
+  flush();
 #endif
 }
 
 void CudaModel::flush() {
   size_t cur_input = 0;
   size_t cur_target = 0;
-  thrust::device_vector<int32_t> d_inputbuf(inputbuf_);
-  thrust::device_vector<int32_t> d_targetbuf(targetbuf_);
-  thrust::device_vector<real> d_hiddenbuf(args_->dim*inputbufpos_.size(), 0.0);
-  thrust::device_vector<real> d_gradbuf(args_->dim*inputbufpos_.size(), 0.0);
+  thrust::device_vector<int32_t> d_inputbuf(inputbuf_.size());
+  thrust::device_vector<int32_t> d_targetbuf(targetbuf_.size());
+  thrust::device_vector<real> d_hiddenbuf(inputbufpos_.size()*args_->dim);
+  thrust::device_vector<real> d_gradbuf(inputbufpos_.size()*args_->dim);
   int32_t* p_input = thrust::raw_pointer_cast(d_inputbuf.data());
   int32_t* p_target = thrust::raw_pointer_cast(d_targetbuf.data());
-  real* p_hidden = thrust::raw_pointer_cast(d_hiddenbuf.data());
-  real* p_grad = thrust::raw_pointer_cast(d_gradbuf.data());
+  d_hidden_ = thrust::raw_pointer_cast(d_hiddenbuf.data());
+  d_grad_ = thrust::raw_pointer_cast(d_gradbuf.data());
+  cudaMemcpyAsync(p_input, inputbuf_.data(), inputbuf_.size()*sizeof(int32_t), cudaMemcpyHostToDevice, stream_);
+  cudaMemcpyAsync(p_target, targetbuf_.data(), targetbuf_.size()*sizeof(int32_t), cudaMemcpyHostToDevice, stream_);
+  cudaMemsetAsync(d_hidden_, 0, inputbufpos_.size()*args_->dim*sizeof(real), stream_);
+  cudaMemsetAsync(d_grad_, 0, inputbufpos_.size()*args_->dim*sizeof(real), stream_);
   thrust::host_vector<int32_t>::const_iterator it_inputpos(inputbufpos_.begin()), it_inputposend(inputbufpos_.end());
   thrust::host_vector<int32_t>::const_iterator it_targetpos(targetbufpos_.begin());
   thrust::host_vector<int32_t>::const_iterator it_target(target_.begin());
@@ -478,13 +500,15 @@ void CudaModel::flush() {
     else
       target = *it_target;
 
-    update_internal(d_input, d_input_n, d_target, d_target_n, target, p_hidden, p_grad, lr);
+    update_internal(d_input, d_input_n, d_target, d_target_n, target, lr);
 
     cur_input += d_input_n;
     cur_target += d_target_n;
-    p_hidden += args_->dim;
-    p_grad += args_->dim;
     it_inputpos++;
+    if( it_inputpos != it_inputposend ) {
+      d_hidden_ += args_->dim;
+      d_grad_ += args_->dim;
+    }
     if( args_->loss==loss_name::ova )
       it_targetpos++;
     else
@@ -501,27 +525,30 @@ void CudaModel::flush() {
   target_.clear();
   lrbuf_.clear();
   cudaStreamSynchronize(stream_);
+
+#ifdef _COMPARE_WITH_CPU_
+  // compare result from gpu and cpu
+  verify("after flush");
+#endif
 }
 
-void CudaModel::computeHidden(int32_t* d_input, int32_t d_input_n, real* hidden) {
+void CudaModel::computeHidden(int32_t* d_input, int32_t d_input_n) {
   CudacomputeHidden<<<d_input_n, args_->dim, 0, stream_>>>(
     d_input, d_input_n,
-    hidden,
+    d_hidden_,
     thrust::raw_pointer_cast(d_wi_->data()));
 
-  CudaAverageHidden<<<1, args_->dim, 0, stream_>>>(d_input_n, hidden);
+  CudaAverageHidden<<<1, args_->dim, 0, stream_>>>(d_input_n, d_hidden_);
 }
 
 void CudaModel::update_internal(
     int32_t* d_input, int32_t d_input_n,
     int32_t* d_target, int32_t d_target_n,
     int32_t target,
-    real* hidden, 
-    real* grad,
     real lr) {
-  computeHidden(d_input, d_input_n, hidden);
-  computeLoss(target, d_target, d_target_n, hidden, grad, lr);
-  computeInput(d_input, d_input_n, grad);
+  computeHidden(d_input, d_input_n);
+  computeLoss(target, d_target, d_target_n, lr);
+  computeInput(d_input, d_input_n);
 }
 
 } // namespace fasttext
