@@ -16,7 +16,6 @@ thrust::device_vector<real>* CudaModel::d_wo_;
 thrust::device_vector<real>* CudaModel::d_t_sigmoid_;
 thrust::device_vector<real>* CudaModel::d_t_log_;
 thrust::device_vector<real>* CudaModel::d_negatives_;
-thrust::device_vector<int32_t>* CudaModel::d_oneVsAll_target_;
 thrust::device_vector<real>* CudaModel::d_total_loss_;
 thrust::device_vector<unsigned long long int>* CudaModel::d_nexamples_;
 
@@ -33,21 +32,15 @@ CudaModel::CudaModel(
     targetpos_(0) {
   std::lock_guard<std::mutex> lck(initmtx_);
   if( !inited_ ) {
-    printf("Copy input weight vetor with size %d bytes, please make sure you have got enough gpu memory\n", wi_->vector().size()*sizeof(real));
+    printf("Copy input weight vetor with size %lu bytes, please make sure you have got enough gpu memory\n", wi_->vector().size()*sizeof(real));
     d_wi_ = new thrust::device_vector<real>(wi_->vector());
-    printf("Copy output weight vetor with size %d bytes, please make sure you have got enough gpu memory\n", wo_->vector().size()*sizeof(real));
+    printf("Copy output weight vetor with size %lu bytes, please make sure you have got enough gpu memory\n", wo_->vector().size()*sizeof(real));
     d_wo_ = new thrust::device_vector<real>(wo_->vector());
     d_t_sigmoid_ = new thrust::device_vector<real>(t_sigmoid_);
     d_t_log_ = new thrust::device_vector<real>(t_log_);
     d_negatives_ = new thrust::device_vector<real>(negatives_);
     d_total_loss_ = new thrust::device_vector<real>(1, 0.0);
     d_nexamples_ = new thrust::device_vector<unsigned long long int>(1, 1);
-    if(args->loss == loss_name::ova) {
-      thrust::host_vector<real> h_oneVsAll_target(osz_);
-      for(int32_t i=0; i<osz_; i++ )
-        h_oneVsAll_target[i] = i;
-      d_oneVsAll_target_ = new thrust::device_vector<int32_t>(h_oneVsAll_target);
-    }
     assert(thrust::raw_pointer_cast(d_wi_->data()));
     assert(thrust::raw_pointer_cast(d_wo_->data()));
     assert(thrust::raw_pointer_cast(d_t_sigmoid_->data()));
@@ -78,21 +71,21 @@ real CudaModel::getLoss() {
 #ifndef _COMPARE_WITH_CPU_
   nexamples_++;
 #endif
-  cudaStreamSynchronize(stream_);
   thrust::host_vector<real> loss(*d_total_loss_);
   thrust::host_vector<unsigned long long int> nexamples(*d_nexamples_);
+  cudaStreamSynchronize(stream_);
   return loss[0] / nexamples[0];
 }
 
 void CudaModel::CudaCleanup(std::shared_ptr<Matrix> wi, std::shared_ptr<Matrix> wo) {
   thrust::copy(d_wi_->begin(), d_wi_->end(), wi->vector().begin());
   thrust::copy(d_wo_->begin(), d_wo_->end(), wo->vector().begin());
+  cudaDeviceSynchronize();
   delete d_wi_;
   delete d_wo_;
   delete d_t_sigmoid_;
   delete d_t_log_;
   delete d_negatives_;
-  delete d_oneVsAll_target_;
   delete d_total_loss_;
   delete d_nexamples_;
   cudaDeviceReset();
@@ -136,7 +129,7 @@ void CudaModel::verify(const char* prefix) {
   thrust::host_vector<unsigned long long int> nexamples(*d_nexamples_);
   cudaStreamSynchronize(stream_);
   if( nexamples[0]!=nexamples_ )
-    printf("samples not match: (h)%lu, (d)%lu\n", nexamples_, nexamples[0]);
+    printf("samples not match: (h)%lu, (d)%llu\n", nexamples_, nexamples[0]);
   printf("\n%s end\n", prefix);
 }
 
@@ -224,24 +217,10 @@ void CudabinaryLogistic(int32_t* target, Bool* label, real lr,
   }
 }
 
-void CudaModel::negativeSampling(int32_t target, real lr) {
-  thrust::host_vector<Bool> h_target(args_->neg+1);
-  thrust::host_vector<int32_t> h_label(args_->neg+1);
-  for (int32_t n = 0; n <= args_->neg; n++) {
-    if (n == 0) {
-      h_target[n] = target;
-      h_label[n] = 1;
-    } else {
-      h_target[n] = getNegative(target);
-      h_label[n] = 0;
-    }
-  }
-  d_target_ = h_target;
-  d_label_ = h_label;
-
+void CudaModel::negativeSampling(int32_t* d_target, Bool* d_label, real lr) {
   CudabinaryLogistic<<<args_->neg+1, args_->dim, 0, stream_>>>(
-    thrust::raw_pointer_cast(d_target_.data()),
-    thrust::raw_pointer_cast(d_label_.data()),
+    d_target,
+    d_label,
     lr,
     d_hidden_,
     thrust::raw_pointer_cast(d_wo_->data()),
@@ -252,19 +231,10 @@ void CudaModel::negativeSampling(int32_t target, real lr) {
     thrust::raw_pointer_cast(d_t_sigmoid_->data()));
 }
 
-void CudaModel::hierarchicalSoftmax(int32_t target, real lr) {
-  const std::vector<bool>& binaryCode = codes[target];
-  const std::vector<int32_t>& pathToRoot = paths[target];
-  thrust::host_vector<int32_t> h_label(pathToRoot.size());
-  std::vector<bool>::const_iterator it(binaryCode.begin()), itend(binaryCode.end());
-  for( size_t i=0; it!=itend; it++, i++ )
-    h_label[i] = (*it)?1:0;
-  d_target_ = pathToRoot;
-  d_label_ = h_label;
-
-  CudabinaryLogistic<<<pathToRoot.size(), args_->dim, 0, stream_>>>(
-    thrust::raw_pointer_cast(d_target_.data()),
-    thrust::raw_pointer_cast(d_label_.data()),
+void CudaModel::hierarchicalSoftmax(int32_t* d_target, int32_t d_target_n, Bool* d_label, real lr) {
+  CudabinaryLogistic<<<d_target_n, args_->dim, 0, stream_>>>(
+    d_target,
+    d_label,
     lr, 
     d_hidden_,
     thrust::raw_pointer_cast(d_wo_->data()),
@@ -363,28 +333,10 @@ void CudaModel::softmax(int32_t target, real lr) {
   FullyConnectedBackward(target, lr);
 }
 
-__global__
-void CudaUpdateOnVsAllLabel(const int32_t* target, const size_t target_n, Bool* label, size_t label_n) {
-  int idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if( idx >= target_n )
-    return;
-  if( target[idx]<label_n )
-    label[target[idx]] = 1;
-}
-
-void CudaModel::oneVsAll(int32_t* d_target, int32_t d_target_n, real lr) {
-  int threadCnt = std::min<size_t>(1024, d_target_n);
-  int blockCnt = (d_target_n+threadCnt-1)/threadCnt;
-  thrust::host_vector<Bool> h_label(osz_, 0);
-  d_label_ = h_label;
-  CudaUpdateOnVsAllLabel<<<blockCnt, threadCnt, 0, stream_>>>(
-    d_target, d_target_n,
-    thrust::raw_pointer_cast(d_label_.data()),
-    osz_);
-
-  CudabinaryLogistic<<<d_oneVsAll_target_->size(), args_->dim, 0, stream_>>>(
-    thrust::raw_pointer_cast(d_oneVsAll_target_->data()),
-    thrust::raw_pointer_cast(d_label_.data()),
+void CudaModel::oneVsAll(int32_t* d_target, int32_t d_target_n, Bool* d_label, real lr) {
+  CudabinaryLogistic<<<d_target_n, args_->dim, 0, stream_>>>(
+    d_target,
+    d_label,
     lr,
     d_hidden_,
     thrust::raw_pointer_cast(d_wo_->data()),
@@ -398,15 +350,16 @@ void CudaModel::oneVsAll(int32_t* d_target, int32_t d_target_n, real lr) {
 void CudaModel::computeLoss(
     int32_t target,
     int32_t* d_target, int32_t d_target_n,
+    Bool* d_label,
     real lr) {
   if (args_->loss == loss_name::ns) {
-    negativeSampling(target, lr);
+    negativeSampling(d_target, d_label, lr);
   } else if (args_->loss == loss_name::hs) {
-    hierarchicalSoftmax(target, lr);
+    hierarchicalSoftmax(d_target, d_target_n, d_label, lr);
   } else if (args_->loss == loss_name::softmax) {
     softmax(target, lr);
   } else if (args_->loss == loss_name::ova) {
-    oneVsAll(d_target, d_target_n, lr);
+    oneVsAll(d_target, d_target_n, d_label, lr);
   } else {
     throw std::invalid_argument("Unhandled loss function for this model.");
   }
@@ -450,11 +403,49 @@ void CudaModel::update(
   inputpos_ += input.size();
   inputbufpos_.push_back(inputpos_);
   if(args_->loss == loss_name::ova) {
-    targetbuf_.insert(targetbuf_.end(), targets.begin(), targets.end());
-    targetpos_ += targets.size();
+    thrust::host_vector<int32_t> h_target(osz_);
+    thrust::host_vector<Bool> h_label(osz_);
+    for (int32_t i = 0; i < osz_; i++) {
+      h_label[i] = utils::contains(targets, i)?1:0;
+      h_target[i] = i;
+    }
+    targetbuf_.insert(targetbuf_.end(), h_target.begin(), h_target.end());
+    targetpos_ += h_target.size();
     targetbufpos_.push_back(targetpos_);
-  } else {
+    labelbuf_.insert(labelbuf_.end(), h_label.begin(), h_label.end());
+  } else if( args_->loss == loss_name::hs) {
+    int32_t target = targets[targetIndex];
+    const std::vector<bool>& binaryCode = codes[target];
+    const std::vector<int32_t>& pathToRoot = paths[target];
+    thrust::host_vector<Bool> h_label(pathToRoot.size());
+    std::vector<bool>::const_iterator it(binaryCode.begin()), itend(binaryCode.end());
+    for( size_t i=0; it!=itend; it++, i++ )
+      h_label[i] = (*it)?1:0;
+    targetbuf_.insert(targetbuf_.end(), pathToRoot.begin(), pathToRoot.end());
+    targetpos_ += pathToRoot.size();
+    targetbufpos_.push_back(targetpos_);
+    labelbuf_.insert(labelbuf_.end(), h_label.begin(), h_label.end());
+  } else if( args_->loss == loss_name::ns) {
+    int32_t target = targets[targetIndex];
+    thrust::host_vector<int32_t> h_target(args_->neg+1);
+    thrust::host_vector<Bool> h_label(args_->neg+1);
+    for (int32_t n = 0; n <= args_->neg; n++) {
+      if (n == 0) {
+        h_target[n] = target;
+        h_label[n] = 1;
+      } else {
+        h_target[n] = getNegative(target);
+        h_label[n] = 0;
+      }
+    }
+    targetbuf_.insert(targetbuf_.end(), h_target.begin(), h_target.end());
+    targetpos_ += h_target.size();
+    targetbufpos_.push_back(targetpos_);
+    labelbuf_.insert(labelbuf_.end(), h_label.begin(), h_label.end());
+  } else if( args_->loss == loss_name::softmax ) {
     target_.push_back(targets[targetIndex]);
+  } else {
+    assert(false);
   }
   lrbuf_.push_back(lr);
 
@@ -474,14 +465,17 @@ void CudaModel::flush() {
   size_t cur_target = 0;
   thrust::device_vector<int32_t> d_inputbuf(inputbuf_.size());
   thrust::device_vector<int32_t> d_targetbuf(targetbuf_.size());
+  thrust::device_vector<Bool> d_labelbuf(labelbuf_.size());
   thrust::device_vector<real> d_hiddenbuf(inputbufpos_.size()*args_->dim);
   thrust::device_vector<real> d_gradbuf(inputbufpos_.size()*args_->dim);
   int32_t* p_input = thrust::raw_pointer_cast(d_inputbuf.data());
   int32_t* p_target = thrust::raw_pointer_cast(d_targetbuf.data());
+  Bool* p_label = thrust::raw_pointer_cast(d_labelbuf.data());
   d_hidden_ = thrust::raw_pointer_cast(d_hiddenbuf.data());
   d_grad_ = thrust::raw_pointer_cast(d_gradbuf.data());
   cudaMemcpyAsync(p_input, inputbuf_.data(), inputbuf_.size()*sizeof(int32_t), cudaMemcpyHostToDevice, stream_);
   cudaMemcpyAsync(p_target, targetbuf_.data(), targetbuf_.size()*sizeof(int32_t), cudaMemcpyHostToDevice, stream_);
+  cudaMemcpyAsync(p_label, labelbuf_.data(), labelbuf_.size()*sizeof(Bool), cudaMemcpyHostToDevice, stream_);
   cudaMemsetAsync(d_hidden_, 0, inputbufpos_.size()*args_->dim*sizeof(real), stream_);
   cudaMemsetAsync(d_grad_, 0, inputbufpos_.size()*args_->dim*sizeof(real), stream_);
   thrust::host_vector<int32_t>::const_iterator it_inputpos(inputbufpos_.begin()), it_inputposend(inputbufpos_.end());
@@ -491,16 +485,17 @@ void CudaModel::flush() {
   while( it_inputpos != it_inputposend ) {
     int32_t* d_input = p_input + cur_input;
     int32_t* d_target = p_target + cur_target;
+    Bool* d_label = p_label + cur_target;
     int32_t d_input_n = *it_inputpos - cur_input;
     real lr = *it_lr;
     int32_t d_target_n = 0;
     int32_t target = 0;
-    if( args_->loss==loss_name::ova )
+    if( args_->loss==loss_name::ova || args_->loss==loss_name::hs || args_->loss==loss_name::ns )
       d_target_n = *it_targetpos - cur_target;
-    else
+    else // softmax
       target = *it_target;
 
-    update_internal(d_input, d_input_n, d_target, d_target_n, target, lr);
+    update_internal(d_input, d_input_n, d_target, d_target_n, d_label, target, lr);
 
     cur_input += d_input_n;
     cur_target += d_target_n;
@@ -509,9 +504,9 @@ void CudaModel::flush() {
       d_hidden_ += args_->dim;
       d_grad_ += args_->dim;
     }
-    if( args_->loss==loss_name::ova )
+    if( args_->loss==loss_name::ova || args_->loss==loss_name::hs || args_->loss==loss_name::ns )
       it_targetpos++;
-    else
+    else  // softmax
       it_target++;
     it_lr++;
   }
@@ -520,6 +515,7 @@ void CudaModel::flush() {
   targetpos_ = 0;
   inputbuf_.clear();
   targetbuf_.clear();
+  labelbuf_.clear();
   inputbufpos_.clear();
   targetbufpos_.clear();
   target_.clear();
@@ -544,10 +540,11 @@ void CudaModel::computeHidden(int32_t* d_input, int32_t d_input_n) {
 void CudaModel::update_internal(
     int32_t* d_input, int32_t d_input_n,
     int32_t* d_target, int32_t d_target_n,
+    Bool* d_label,
     int32_t target,
     real lr) {
   computeHidden(d_input, d_input_n);
-  computeLoss(target, d_target, d_target_n, lr);
+  computeLoss(target, d_target, d_target_n, d_label, lr);
   computeInput(d_input, d_input_n);
 }
 

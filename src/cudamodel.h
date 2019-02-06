@@ -33,11 +33,11 @@ class CudaModel : public Model {
  protected:
   void computeLoss(int32_t target,
     int32_t* d_target, int32_t d_target_n,
-    real lr);
-  void negativeSampling(int32_t target, real lr);
-  void hierarchicalSoftmax(int32_t target, real lr);
+    Bool* d_label, real lr);
+  void negativeSampling(int32_t* d_target, Bool* d_label, real lr);
+  void hierarchicalSoftmax(int32_t* d_target, int32_t d_target_n, Bool* d_label, real lr);
   void softmax(int32_t target, real lr); 
-  void oneVsAll(int32_t* d_target, int32_t d_target_n, real lr);
+  void oneVsAll(int32_t* d_target, int32_t d_target_n, Bool* d_label, real lr);
   void computeInput(int32_t* d_input, int32_t d_input_n);
   void computeHidden(int32_t* d_input, int32_t d_input_n);
 
@@ -46,7 +46,7 @@ class CudaModel : public Model {
   void FullyConnectedBackward(int32_t target, real lr);
   void flush();
   void update_internal(int32_t* d_input, int32_t d_input_n,
-    int32_t* d_target, int32_t d_target_n, int32_t target, real lr);
+    int32_t* d_target, int32_t d_target_n, Bool* d_label, int32_t target, real lr);
 
  protected:
   static std::mutex initmtx_;
@@ -56,7 +56,6 @@ class CudaModel : public Model {
   static thrust::device_vector<real>* d_t_sigmoid_;
   static thrust::device_vector<real>* d_t_log_;
   static thrust::device_vector<real>* d_negatives_;
-  static thrust::device_vector<int32_t>* d_oneVsAll_target_;
   static thrust::device_vector<real>* d_total_loss_;
   static thrust::device_vector<unsigned long long int>* d_nexamples_;
   real* d_hidden_;
@@ -65,8 +64,6 @@ class CudaModel : public Model {
   thrust::device_vector<real> d_output_diff_;
   real* d_grad_;
   thrust::device_vector<int32_t> d_input_;
-  thrust::device_vector<Bool> d_label_;
-  thrust::device_vector<int32_t> d_target_;
 
   thrust::host_vector<int32_t> inputbuf_;
   thrust::host_vector<int32_t> inputbufpos_;
@@ -75,6 +72,7 @@ class CudaModel : public Model {
   thrust::host_vector<int32_t> targetbufpos_;
   int32_t targetpos_;
   thrust::host_vector<int32_t> target_;
+  thrust::host_vector<Bool> labelbuf_;
   thrust::host_vector<real> lrbuf_;
 
   cudaStream_t stream_;
